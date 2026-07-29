@@ -1316,7 +1316,7 @@ PYTHONIOENCODING=utf-8 PYTHONUTF8=1 /d/condapy/quantum_env/python \
 
 ---
 
-###阶段 5：P1 代码审查门（修订后清单）
+### 阶段 5：P1 代码审查门（修订后清单）
 
 审查组subagent 的审查 prompt需要更新，覆盖 v3 的改动和新增的诊断脚本：
 
