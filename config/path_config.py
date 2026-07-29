@@ -7,7 +7,7 @@ C:\\PAEMS-... 与 C:\\Users\\10124\\Desktop\\... 在本机不存在）。
 from pathlib import Path
 
 # 工作区根（双层 alphaquibit-main）
-PROJECT_ROOT = Path(r"D:\STUDY\Project\BERT\BERT")
+PROJECT_ROOT = Path(r"D:/Code/LZai/Ai for QEC/Alpha-qubit/code/alphaquibit-main/alphaquibit-main")
 
 # 官方 PAEMS 代码
 PAEMS_ROOT = PROJECT_ROOT / "PAEMS" / "PAEMS-Precise_and_Adaptive_Error_Model_for_superconducting_Quantum_Processors-main"
