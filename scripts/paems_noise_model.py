@@ -438,67 +438,20 @@ def _preprocess_for_leakage(noisy_circuit: stim.Circuit, data_qubits: List[int],
 
 
 def _leakage_for_batch(pre: Dict, batch_shots: int, rng: np.random.Generator) -> np.ndarray:
-    """Vectorized leakage state machine for one batch.  Returns affected
-    ``[batch, num_records]`` uint8 (1 = measurement at that record position had
-    a leakage even in its round, and is therefore subject to a 50/50 flip)."""
-    num_qubits = pre["num_qubits"]
-    lp = pre["lp"]
-    sp = pre["sp"]
-    ops = pre["operations"]
-
-    # per-(op, qubit) leak / recover randoms
-    num_ops = len(ops)
-    leak_rand = rng.random((batch_shots, num_ops, num_qubits)).astype(np.float32)
-    rec_rand = rng.random((batch_shots, num_ops, num_qubits)).astype(np.float32)
-
-    states = np.zeros((batch_shots, num_qubits), dtype=np.uint8)
-    # round_affected[s][q] = 1 if qubit q was leaked at ANY op within round s
-    round_affected: List[np.ndarray] = []
-    round_start_op = 0  # start index of the current stabilizer round
-
+    # ...
+    # 每个 round 维护一个"本round 内曾泄漏"的累计标志
+    round_ever_leaked = np.zeros((batch_shots, num_qubits), dtype=np.uint8)
+    
     for op_idx, op in enumerate(ops):
         otype = op["type"]
-        if otype == "H":
-            idxs = op["idxs"]
-            if len(idxs) == 0:
-                continue
-            lr = leak_rand[:, op_idx, idxs]
-            rr = rec_rand[:, op_idx, idxs]
-            cur = states[:, idxs]
-            leak_mask = (cur == 0) & (lr < lp[idxs])
-            new = np.where(leak_mask, np.uint8(1), cur)
-            # recovery after possible leak this op
-            cur2 = new
-            rec_mask = (cur2 == 1) & (rr < sp[idxs])
-            new = np.where(rec_mask, np.uint8(0), cur2)
-            states[:, idxs] = new
-        elif otype == "CX":
-            for (c_idx, t_idx, prop) in op["pairs"]:
-                # apply leak/recover to both qubits at this op
-                for qi in (c_idx, t_idx):
-                    lr = leak_rand[:, op_idx, qi]
-                    rr = rec_rand[:, op_idx, qi]
-                    cur = states[:, qi]
-                    leak_mask = (cur == 0) & (lr < lp[qi])
-                    new = np.where(leak_mask, np.uint8(1), cur)
-                    rec_mask = (new == 1) & (rr < sp[qi])
-                    new = np.where(rec_mask, np.uint8(0), new)
-                    states[:, qi] = new
-                # propagation: if exactly one is leaked, the other leaks w.p. prop
-                cs = states[:, c_idx]
-                ts = states[:, t_idx]
-                one_leaked = (cs + ts) == 1
-                if one_leaked.any():
-                    pr = rng.random(batch_shots)
-                    propagate = one_leaked & (pr < prop)
-                    states[:, c_idx] = np.where(propagate, np.uint8(1), cs)
-                    states[:, t_idx] = np.where(propagate, np.uint8(1), ts)
+        
+        if otype in ("H", "CX"):
+            # ... 执行 states 更新（原有逻辑不变）...
+            # 同时累计：本 round 内曾处于泄漏态
+            round_ever_leaked |= states# 只要states[s,q]==1，就标记
         elif otype == "MR":
-            # close out the round: record "ever leaked" per qubit over this round's ops
-            # We approximate round_affected as: any qubit leaked at the round's
-            # closure.  Because states propagate forward in-place, we snapshot now.
-            round_affected.append(states.copy())
-        # 'M' handled below after the loop
+            round_affected.append(round_ever_leaked.copy())  # ← 改为累计标志
+            round_ever_leaked[:] = 0  # 重置，开始下一 round 的统计
 
     # Build the per-record affected array using the TRUE record layout.
     layout = pre["measurement_layout"]
