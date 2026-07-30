@@ -36,6 +36,9 @@ from path_config import (PAEMS_SC, TIERS_DIR, DATA_DIR, CONFIG_DIR, LOG_DIR,
 sys.path.insert(0, str(PAEMS_SC))
 from inject_basic_noise import inject_surface_code_noise          # noqa: E402
 from surface_code_generate_circuits import generate_surface_code_circuit  # noqa: E402
+from stream_decoder import make_xzzx_decoder_fn
+from xzzx_decoder import XZZXAlphaQubitDecoder
+from xzzx_coord import XZZXCoordinateSystem
 
 def _n_data_from_circuit(circuit: stim.Circuit) -> int:
     """末尾 M 指令的 target 数 = data qubit 数。
@@ -255,6 +258,73 @@ def generate_one(distance, rounds, basis, num_samples, *, config_path, snr=10.0,
                   "xzzx_template": str(template), "patch": GOOGLE_PATCH[distance]},
     }
 
+import gc as _gc
+
+def stream_one(distance, rounds, basis, num_samples, *, config_path,
+               snr=10.0, t=0.01, seed=42, chunk_size=2000, rng_seed=None):
+    """
+    流式版本：逐 chunk yield，不预分配全量数组，不落盘。
+
+    每个 yield 的字典键与 generate_one 返回值一致：
+      measurement_iq, final_iq, measurement, event,
+      final_soft, label, detection_events
+
+    调用方处理完chunk 后直接 return（不赋值到外部变量），GC 自动回收。
+    """
+    template = google_template_path(distance, basis, rounds)
+    base, dq, xs, zs, cx = generate_surface_code_circuit(
+        distance, rounds, basis, code_variant='xzzx', xzzx_template=str(template))
+    noisy = inject_surface_code_noise(base, dq, xs, zs, cx, str(config_path))
+
+    n_data = _n_data_from_circuit(noisy)
+    total_records = noisy.num_measurements
+    assert (total_records - n_data) % rounds == 0
+    n_stab = (total_records - n_data) // rounds
+
+    meas_sampler = noisy.compile_sampler(seed=seed)
+    m2d = noisy.compile_m2d_converter()iq_sim = pir.ThreeCenterIQReadoutSimulator(snr=snr, t=t)
+    iq_rng = np.random.default_rng(rng_seed if rng_seed is not None else seed)
+    num_det = noisy.num_detectors
+
+    start = 0
+    while start < num_samples:
+        chunk = min(chunk_size, num_samples - start)
+
+        true_bits = meas_sampler.sample(shots=chunk)iq_all = iq_sim.sample_iq(true_bits, leaked=None, rng=iq_rng)
+        hard_bits = iq_sim.hard_decision(iq_all)
+        detobs = m2d.convert(measurements=hard_bits, separate_observables=True)
+        dets = np.asarray(detobs[0], dtype=bool)
+        obs  = np.asarray(detobs[1], dtype=bool).reshape(-1)iq_anc = iq_all[:, :rounds * n_stab].reshape(chunk, rounds, n_stab)
+        iq_fin = iq_all[:, rounds * n_stab:]
+
+        soft_meas = iq_sim.to_soft_prob(iq_anc)
+        soft_event = np.empty_like(soft_meas)
+        soft_event[:, 0, :] = soft_meas[:, 0, :]
+        for tt in range(1, rounds):
+            soft_event[:, tt, :] = pir.soft_xor(soft_meas[:, tt, :], soft_meas[:, tt - 1, :])
+        soft_final = iq_sim.to_soft_prob(iq_fin)
+
+        chunk_data = {
+            "measurement_iq":   iq_anc.astype(np.complex64),
+            "final_iq":         iq_fin.astype(np.complex64),
+            "measurement":      soft_meas,
+            "event":            soft_event,
+            "final_soft":       soft_final,
+            "label":            obs.astype(np.float32),
+            "detection_events": dets.astype(np.float32),#元信息挂在第一个 chunk，方便调用方感知
+            "_meta": {
+                "seed": int(seed), "t": float(t), "basis": basis.upper(),
+                "n_stab": int(n_stab), "n_data": int(n_data),
+                "num_detectors": int(num_det),
+                "chunk_start": int(start), "chunk_size": int(chunk),} if start == 0 else None,
+        }
+
+        yield chunk_data
+
+        del chunk_data, iq_all, true_bits, hard_bits, dets, obs
+        _gc.collect()
+
+        start += chunk
 
 def save_pt(data, out_path):
     import torch
@@ -286,73 +356,85 @@ def export_b8(data, out_dir, name):
 # ---------------- main ----------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--smoke', action='store_true', help='P1 烟测：1k 样本 d5 r10 Z')
-    ap.add_argument('--distance', type=int, default=5)
-    ap.add_argument('--rounds', type=int, default=10)
-    ap.add_argument('--basis', type=str, default='Z')
-    ap.add_argument('--num-samples', type=int, default=1000)
-    ap.add_argument('--level', type=int, default=2)
-    ap.add_argument('--xtalk', type=str, default='X2')
-    ap.add_argument('--snr', type=float, default=10.0)
-    ap.add_argument('--t', type=float, default=0.01)
-    ap.add_argument('--seed', type=int, default=42)
-    ap.add_argument('--out-dir', type=str, default=str(DATA_DIR / 'smoke'))
+    ap.add_argument('--smoke',      action='store_true')
+    ap.add_argument('--distance',   type=int,   default=5)
+    ap.add_argument('--rounds',     type=int,   default=10)
+    ap.add_argument('--basis',      type=str,   default='Z')
+    ap.add_argument('--num-samples',type=int,   default=1000)
+    ap.add_argument('--level',      type=int,   default=2)
+    ap.add_argument('--xtalk',      type=str,   default='X2')
+    ap.add_argument('--snr',        type=float, default=10.0)
+    ap.add_argument('--t',          type=float, default=0.01)
+    ap.add_argument('--seed',       type=int,   default=42)
+    ap.add_argument('--chunk-size', type=int,   default=2000)
+    ap.add_argument('--out-dir',    type=str,   default=str(DATA_DIR / 'smoke'))
+    ap.add_argument('--stream',action='store_true',
+                    help='流式模式：生成→XZZX解码→丢弃，不写.pt')
+    ap.add_argument('--checkpoint', type=str, default=None,
+                    help='XZZXAlphaQubitDecoder 检查点路径')
+    ap.add_argument('--device', type=str, default='cuda')ap.add_argument('--chunk-size', type=int, default=2000)
     args = ap.parse_args()
 
     if args.smoke:
         args.distance, args.rounds, args.basis, args.num_samples = 5, 10, 'Z', 1000
 
-    print(f"[smoke/P1] d{args.distance} r{args.rounds} {args.basis} N={args.num_samples} "
-          f"level={args.level} xtalk={args.xtalk} snr={args.snr}")
-
     template = google_template_path(args.distance, args.basis, args.rounds)
-    print(f"[template] {template} (exists={template.exists()})")
+    cfg = build_config(args.distance, args.rounds, template,
+                       level=args.level, xtalk=args.xtalk,
+                       out_path=CONFIG_DIR / f"smoke_d{args.distance}_r{args.rounds}.json")
 
-    t0 = time.time()
-    cfg = build_config(args.distance, args.rounds, template, level=args.level,
-                       xtalk=args.xtalk, out_path=CONFIG_DIR / f"smoke_d{args.distance}_r{args.rounds}.json")
-    print(f"[config] built in {time.time()-t0:.1f}s -> {cfg}")
+# ── 流式模式（不落盘）────────────────────────────────────────────────────
+    if args.stream:
+        print(f"[stream] d{args.distance} r{args.rounds} {args.basis} "
+              f"N={args.num_samples} chunk={args.chunk_size}")
 
-    t0 = time.time()
-    data = generate_one(args.distance, args.rounds, args.basis, args.num_samples,
-                        config_path=cfg, snr=args.snr, t=args.t, seed=args.seed)
-    print(f"[gen] {args.num_samples} samples in {time.time()-t0:.1f}s")
+        # ── 构建 XZZX 坐标系（从 Google 模板电路） ───────────────────────────
+        circuit_path = (GOOGLE_SC
+                        / f"d{args.distance}_at_{GOOGLE_PATCH[args.distance]}"
+                        / args.basis
+                        / f"r{args.rounds:02d}"
+                        / "circuit_ideal.stim")
+        ideal_cir    = stim.Circuit.from_file(str(circuit_path))
+        coord_system = XZZXCoordinateSystem(args.distance, ideal_cir)
+        print(f"[coord] grid={coord_system.grid_size}×{coord_system.grid_size}"
+              f"n_stab={coord_system.n_stab}  n_data={coord_system.n_data}")
 
-    # ---- 烟测诊断 ----
-    print("\n=== P1 smoke diagnostics ===")
-    print(f"  shapes: meas{data['measurement'].shape} event{data['event'].shape} "
-          f"final_soft{data['final_soft'].shape} det{data['detection_events'].shape} label{data['label'].shape}")
-    print(f"  n_stab={data['n_stab']} n_data={data['n_data']} num_det={data['num_detectors']} "
-          f"(expect n_stab=d^2-1={args.distance**2-1}, n_data=d^2={args.distance**2})")
-    print(f"  label rate={float(data['label'].mean()):.4f} (应非0/1、非精确0.5)")
-    print(f"  det density={float(data['detection_events'].mean()):.4f}")
-    # 软读出分布（S3）
-    soft = data['measurement']
-    print(f"  soft meas: min={soft.min():.3f} max={soft.max():.3f} mean={soft.mean():.3f} "
-          f"frac<0.1={float((soft<0.1).mean()):.3f} frac>0.9={float((soft>0.9).mean()):.3f}")
-    print(f"  final_soft: min={data['final_soft'].min():.3f} max={data['final_soft'].max():.3f}")
-    # 软读出双峰（按真值分组近似：用硬测量 anc 做真值）
-    print(f"  event[0]==meas[0] check: {np.allclose(data['event'][:,0,:], data['measurement'][:,0,:])}")
+        # ── 实例化 XZZX 解码器 ────────────────────────────────────────────────
+        xzzx_model = XZZXAlphaQubitDecoder(
+            coord_system=coord_system,
+            embed_dim=256,
+        )
+        decoder_fn = make_xzzx_decoder_fn(
+            model=xzzx_model,
+            device=getattr(args, "device", "cuda"),
+            log_interval=5,
+            checkpoint_path=getattr(args, "checkpoint", None),
+        )
 
-    # ---- 存盘 ----
-    out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
-    name = f"smoke_d{args.distance}_r{args.rounds}_{args.basis}_n{args.num_samples}"
-    pt_path = out_dir / f"{name}.pt"
-    save_pt(data, pt_path)
-    print(f"\n[save .pt] {pt_path} ({pt_path.stat().st_size/1024:.0f} KB)")
+        # ── 流式生成 + 解码 ───────────────────────────────────────────────────
+        samples_done = 0
+        for chunk_idx, chunk in enumerate(stream_one(
+                args.distance, args.rounds, args.basis, args.num_samples,
+                config_path=cfg,
+                snr=args.snr, t=args.t,
+                seed=args.seed, chunk_size=args.chunk_size,
+            )
+        ):
+            decoder_fn(chunk, chunk_idx)      # 推理 + 累积 LER，不落盘
+            samples_done += chunk["detection_events"].shape[0]
+            print(
+                f"  chunk {chunk_idx:4d}: {samples_done:>7d}/{args.num_samples}  "
+                f"det_dens={float(chunk['detection_events'].mean()):.4f}"
+            )
 
-    det_b8, obs_b8 = export_b8(data, out_dir, name)
-    print(f"[export .b8] {det_b8.name} ({det_b8.stat().st_size} B), {obs_b8.name} ({obs_b8.stat().st_size} B)")
-
-    # ---- b8 round-trip 验证（R8 结构）----
-    det_rt = stim.read_shot_data_file(path=str(det_b8), format='b8',
-                                      num_detectors=data['num_detectors'])
-    obs_rt = stim.read_shot_data_file(path=str(obs_b8), format='b8', num_observables=1)
-    match_det = np.array_equal(det_rt, data['detection_events'].astype(bool))
-    match_obs = np.array_equal(obs_rt.reshape(-1), data['label'].astype(bool))
-    print(f"[b8 round-trip] det match={match_det} obs match={match_obs}")
-    print("\n=== P1 smoke DONE ===")
-
+        # ── 打印最终结果 ──────────────────────────────────────────────────────
+        s = decoder_fn.state
+        print("=" * 60)
+        print(f"[stream 完成]  总样本={s['total']:,}")
+        print(f"  最终 LER  = {s['logical_error_rate']:.6f}")
+        print(f"  正确预测  = {s['correct']:,} / {s['total']:,}")
+        print("=" * 60)
+        return
 
 if __name__ == '__main__':
     main()
