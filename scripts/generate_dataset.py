@@ -10,6 +10,14 @@
     python scripts/generate_dataset.py --distance 5 --rounds 25 --num-samples 1000000
 """
 
+# ── 顶部新增导入（与其他 import 放在一起） ───────────────────────────────
+    # from stream_decoder import make_xzzx_decoder_fn
+    # from xzzx_decoder import XZZXAlphaQubitDecoder
+    # 在 main() 开头新增 argparse 参数：
+    #   parser.add_argument("--checkpoint", type=str, default=None)
+    #   parser.add_argument("--device", type=str, default="cuda")
+    #   parser.add_argument("--decoder-only", action="store_true")
+
 import argparse
 import sys
 from pathlib import Path
@@ -23,6 +31,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from alphaqubit.data.stim_generator import StimDataGenerator
 from alphaqubit.data.soft_readout import SoftReadoutSimulator
 
+from stream_decoder import make_xzzx_decoder_fn
+from xzzx_decoder import XZZXAlphaQubitDecoder
+from alphaqubit.data.coordinate_system import CoordinateSystem
 
 def generate_chunk(args):
     """生成一个数据块（在子进程中运行）"""
@@ -68,113 +79,73 @@ def generate_chunk(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Pre-generate training dataset")
-    parser.add_argument("--distance", type=int, default=3)
-    parser.add_argument("--rounds", type=int, default=25)
-    parser.add_argument("--p", type=float, default=0.005)
-    parser.add_argument("--snr", type=float, default=10.0)
-    parser.add_argument("--t", type=float, default=0.01)
-    parser.add_argument("--num-samples", type=int, default=1000000)
-    parser.add_argument("--chunk-size", type=int, default=10000)
-    parser.add_argument("--num-workers", type=int, default=8)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--output-dir", type=str, default="data")
-    parser.add_argument("--output-name", type=str, default=None,
-                       help="Custom output filename (default: d{d}_r{rounds}_n{num_samples}.npz)")
+    parser = argparse.ArgumentParser(description="Stream-generate training dataset (no disk)")
+    parser.add_argument("--distance",    type=int,   default=3)
+    parser.add_argument("--rounds",      type=int,   default=25)
+    parser.add_argument("--p",           type=float, default=0.005)
+    parser.add_argument("--snr",         type=float, default=10.0)
+    parser.add_argument("--t",           type=float, default=0.01)
+    parser.add_argument("--num-samples", type=int,   default=1000000)
+    parser.add_argument("--chunk-size",  type=int,   default=10000)
+    parser.add_argument("--seed",        type=int,   default=42)
+    parser.add_argument("--checkpoint",type=str,   default=None,
+                        help="XZZXAlphaQubitDecoder 检查点路径（None=随机初始化）")
+    parser.add_argument("--device",       type=str,   default="cuda",
+                        help="推理设备 (cuda/cpu)")
+    parser.add_argument("--decoder-only", action="store_true",
+                        help="流式模式：生成→XZZX解码→丢弃，不写任何文件")
     args = parser.parse_args()
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(exist_ok=True)
+    generator= StimDataGenerator(
+        distance=args.distance, rounds=args.rounds,
+        p=args.p, seed=args.seed)
+    soft_sim= SoftReadoutSimulator(snr=args.snr, t=args.t)
 
-    # 计算需要生成的chunk数量
-    num_chunks = (args.num_samples + args.chunk_size - 1) // args.chunk_size
+    # ── 构建坐标系 + 解码器 ───────────────────────────────────────────────────
+    base_circ    = generator.circuit# StimDataGenerator 持有电路
+    coord_system = CoordinateSystem(args.distance, base_circ)
 
-    print("=" * 60)
-    print("Pre-generating Training Dataset")
-    print("=" * 60)
-    print(f"Distance: {args.distance}")
-    print(f"Rounds: {args.rounds}")
-    print(f"Physical error rate: {args.p}")
-    print(f"Total samples: {args.num_samples:,}")
-    print(f"Chunk size: {args.chunk_size:,}")
-    print(f"Number of chunks: {num_chunks}")
-    print(f"Number of workers: {args.num_workers}")
-    print("=" * 60)
-
-    # 准备任务参数
-    tasks = [
-        (i, args.distance, args.rounds, args.p, args.chunk_size,
-         args.seed, args.snr, args.t)
-        for i in range(num_chunks)
-    ]
-
-    # 收集所有数据（不再保存全零的leakage/event_leakage，节省50%空间）
-    all_data = {
-        'measurement': [],
-        'event': [],
-        'final_soft': [],
-        'label': [],
-        'detection_events': [],
-    }
-
-    start_time = time.time()
-    completed = 0
-
-    # 使用多进程生成
-    with ProcessPoolExecutor(max_workers=args.num_workers) as executor:
-        futures = {executor.submit(generate_chunk, task): i for i, task in enumerate(tasks)}
-
-        for future in as_completed(futures):
-            chunk_data = future.result()
-            for key in all_data:
-                all_data[key].append(chunk_data[key])
-
-            completed += 1
-            elapsed = time.time() - start_time
-            samples_done = completed * args.chunk_size
-            rate = samples_done / elapsed
-            eta = (args.num_samples - samples_done) / rate if rate > 0 else 0
-
-            print(f"\rProgress: {completed}/{num_chunks} chunks "
-                  f"({samples_done:,}/{args.num_samples:,} samples) "
-                  f"| Rate: {rate:.0f} samples/s | ETA: {eta:.0f}s", end="")
-
-    print()
-
-    # 合并数据
-    print("Concatenating data...")
-    for key in all_data:
-        all_data[key] = np.concatenate(all_data[key], axis=0)[:args.num_samples]
-
-    # 保存
-    if args.output_name:
-        output_file = output_dir / args.output_name
-    else:
-        output_file = output_dir / f"d{args.distance}_r{args.rounds}_n{args.num_samples}.npz"
-    print(f"Saving to {output_file}...")
-
-    np.savez(
-        output_file,
-        measurement=all_data['measurement'],
-        event=all_data['event'],
-        final_soft=all_data['final_soft'],
-        label=all_data['label'],
-        detection_events=all_data['detection_events'],
-        distance=np.array(args.distance),
-        rounds=np.array(args.rounds),
-        p=np.array(args.p),
-        snr=np.array(args.snr),
+    xzzx_model = XZZXAlphaQubitDecoder(
+        coord_system=coord_system,
+        embed_dim=256,
+    )
+    decoder_fn = make_xzzx_decoder_fn(
+        model=xzzx_model,
+        device=args.device,
+        log_interval=10,
+        checkpoint_path=args.checkpoint,
     )
 
+    print("=" * 60)
+    print(f"Streaming — XZZX Decoder  "
+          f"({'no disk' if args.decoder_only else 'decode only'})")
+    print(f"Distance={args.distance}Rounds={args.rounds}  N={args.num_samples:,}")
+    print(f"Checkpoint: {args.checkpoint or '(随机初始化)'}")
+    print("=" * 60)
+
+    start_time = time.time()
+
+    for chunk_idx, chunk in chunk_stream():
+        # ── 调用 XZZX 解码器推理，不落盘 ─────────────────────────────────────
+        decoder_fn(chunk, chunk_idx)
+
+        samples_done = decoder_fn.state["total"]
+        print(
+            f"\rchunk {chunk_idx:4d}: {samples_done:>9,}/{args.num_samples:,}  "
+            f"running_LR={decoder_fn.state['logical_error_rate']:.5f}",
+            end=""
+        )
+
+    # ── 最终汇总 ──────────────────────────────────
+    s = decoder_fn.state
     elapsed = time.time() - start_time
-    file_size = output_file.stat().st_size / (1024**2)
-
     print("=" * 60)
-    print(f"Done! Generated {args.num_samples:,} samples in {elapsed:.1f}s")
-    print(f"File size: {file_size:.1f} MB")
-    print(f"Rate: {args.num_samples / elapsed:.0f} samples/s")
+    print(f"[完成] {args.num_samples:,} 样本  耗时 {elapsed:.1f}s")
+    print(f"  最终 LER      = {s['logical_error_rate']:.6f}")
+    print(f"  正确预测      = {s['correct']:,} / {s['total']:,}")
+    print(f"  吞吐量        = {s['total'] / elapsed:.0f} samples/s")
+    print(f"  写盘字节      = 0MB（流式模式）")
     print("=" * 60)
-
 
 if __name__ == "__main__":
     main()
