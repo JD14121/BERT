@@ -396,6 +396,98 @@ def sample_paems_iq_dataset(distance: int, rounds: int, num_samples: int,
     }
 
 # ---------------------------------------------------------------------------
+# 4b. 流式 IQ 采样生成器（不积累全量数组，处理完即释放）
+# ---------------------------------------------------------------------------
+import gc as _gc
+
+def stream_paems_iq_dataset(distance: int, rounds: int, num_samples: int,params: Dict, *,
+                             iq: Optional[ThreeCenterIQReadoutSimulator] = None,
+                             snr: float = 10.0, t: float = 0.01,
+                             seed: Optional[int] = None,
+                             chunk_size: int = 4000,
+                             include_leakage: bool = True):
+    """
+    生成器版本：每次 yield 一个 chunk 大小的数据字典，调用方处理后立即丢弃，
+    全程内存只占用一个 chunk，不落盘。
+
+    chunk字典键与sample_paems_iq_dataset 返回值一致：measurement_iq, final_iq, measurement, event, final_soft,
+      leak_soft, final_leak_soft, detection_events, label, leakage
+
+    用法示例：
+        for chunk in stream_paems_iq_dataset(3, 25, 50000, params, seed=42):
+            logits = decoder(chunk['detection_events'])   # 直接推理
+            # chunk离开作用域后被GC 回收，不保存
+    """
+    base = _base_surface_code_circuit(distance, rounds)
+    data_qubits, stab_qubits, cx_pairs = _extract_layout(base)
+    n_stab = distance ** 2 - 1
+
+    noisy = build_paems_circuit_no_readout_spam(base, params, rounds)
+    stim_seed, rng, leak_master = _derive_seeds(seed)
+    meas_sampler = noisy.compile_sampler(seed=stim_seed)
+
+    if iq is None:
+        iq = ThreeCenterIQReadoutSimulator(snr=snr, t=t)
+
+    start = 0
+    while start < num_samples:
+        chunk_n = min(chunk_size, num_samples - start)
+        true_bits = meas_sampler.sample(shots=chunk_n)
+
+        #──泄漏模拟 ──────────────────────────────────────────────────────
+        if include_leakage:
+            chunk_leak_seed = int(leak_master.integers(1, 2 ** 63 - 1))
+            affected = simulate_leakage(
+                noisy, data_qubits, stab_qubits, cx_pairs,
+                params, chunk_n, seed=chunk_leak_seed,
+                batch_size=max(400, chunk_n))
+            leaked_mask = affected.astype(bool)
+            stab_leak = affected[:, :rounds * n_stab].reshape(chunk_n, rounds, n_stab)
+        else:
+            leaked_mask = None
+            stab_leak = np.zeros((chunk_n, rounds, n_stab), dtype=np.uint8)
+
+        # ── IQ 采样 →硬决策 → 探测器 ────────────────────────────────────
+        iq_all = iq.sample_iq(true_bits, leaked_mask, rng)
+        hard = iq.hard_decision(iq_all)
+        dets, obs = rebuild_detectors(noisy, hard)
+
+        # ── 拆分 ancilla / final──────────────────────────────────────────iq_anc = iq_all[:, :rounds * n_stab].reshape(chunk_n, rounds, n_stab)
+        iq_fin = iq_all[:, rounds * n_stab:]
+
+        soft_anc = iq.to_soft_prob(iq_anc)
+        soft_fin = iq.to_soft_prob(iq_fin)
+        leak_anc = iq.leak_prob(iq_anc)
+        leak_fin = iq.leak_prob(iq_fin)
+
+        # event = soft XOR 相邻轮差分
+        event = np.zeros_like(soft_anc)
+        event[:, 0, :] = soft_anc[:, 0, :]
+        for tt in range(1, rounds):
+            event[:, tt, :] = soft_xor(soft_anc[:, tt, :], soft_anc[:, tt - 1, :])
+
+        chunk_data = {
+            "measurement_iq":iq_anc.astype(np.complex64),
+            "final_iq":          iq_fin.astype(np.complex64),
+            "measurement":       soft_anc,
+            "event":             event,
+            "final_soft":        soft_fin,
+            "leak_soft":         leak_anc,
+            "final_leak_soft":   leak_fin,
+            "detection_events":  dets.astype(np.float32),
+            "label":             obs.astype(np.float32),
+            "leakage":           stab_leak.astype(np.float32),
+        }
+
+        yield chunk_data   # ← 交给调用方，调用方 return 后 GC 可回收
+
+        # 主动清理（大chunk 场景显式触发）
+        del chunk_data, iq_all, true_bits, hard, dets, obs
+        _gc.collect()
+
+        start += chunk_n
+
+# ---------------------------------------------------------------------------
 # 5. Saving (complex-aware)
 # ---------------------------------------------------------------------------
 
