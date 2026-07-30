@@ -365,15 +365,18 @@ class FineTuneDecoder(nn.Module):
         self.embed_dim = embed_dim
 
         # 如果提供了预训练模型，从中提取架构参数
+        # 改为（安全读取，缺失则沿用构造函数默认值）
         if pretrained_encoder is not None:
-            arch = pretrained_encoder.arch_config
-            n_heads = arch['n_heads']
-            num_transformer_layers = arch['num_transformer_layers']
-            expansion_factor = arch['expansion_factor']
-            num_conv_layers = arch['num_conv_layers']
-            scale_factor = arch['scale_factor']
-            print(f"[FineTuneDecoder] 从预训练模型提取架构: n_heads={n_heads}, num_layers={num_transformer_layers}, num_conv_layers={num_conv_layers}")
-
+            arch = getattr(pretrained_encoder, 'arch_config', {})
+            n_heads             = arch.get('n_heads',n_heads)
+            num_transformer_layers = arch.get('num_transformer_layers', num_transformer_layers)
+            expansion_factor    = arch.get('expansion_factor',         expansion_factor)
+            num_conv_layers     = arch.get('num_conv_layers',          num_conv_layers)
+            scale_factor        = arch.get('scale_factor',             scale_factor)
+            print(f"[FineTuneDecoder] 架构参数: n_heads={n_heads}, "
+                  f"num_layers={num_transformer_layers}, "
+                  f"num_conv_layers={num_conv_layers}")
+            
         # ==================== 1. Encoder（加载预训练权重）====================
         grid_positions = (coord_system.distance + 1) ** 2
         self.syndrome_embedder = SyndromeEmbedder(
@@ -395,7 +398,7 @@ class FineTuneDecoder(nn.Module):
 
         # 加载预训练权重
         if pretrained_encoder is not None:
-            self._load_pretrained_encoder(pretrained_encoder.get_encoder_state_dict())
+            self._load_from_encoder_module(pretrained_encoder)   # 兼容所有 encoder 类型
         elif pretrained_state_dict is not None:
             self._load_pretrained_encoder(pretrained_state_dict)
 
@@ -430,6 +433,45 @@ class FineTuneDecoder(nn.Module):
 
         nn.init.normal_(self.output_layer.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.output_layer.bias)
+
+    def _load_from_encoder_module(self, encoder: nn.Module):
+        """
+        从任意含 syndrome_embedder / rnn_core 属性的 encoder 加载权重。
+    
+        兼容两种类型：
+        - PretrainDecoder：有 get_encoder_state_dict()，走原路径
+        - AlphaQubitDecoder 子类（XZZXAlphaQubitDecoder）：
+          直接访问 .syndrome_embedder / .rnn_core 属性提取权重
+
+        Args:
+            encoder: 预训练好的 encoder 模块
+        """
+        # 优先走PretrainDecoder 原生接口
+        if hasattr(encoder, 'get_encoder_state_dict'):
+            state = encoder.get_encoder_state_dict()
+            self._load_pretrained_encoder(state)
+            return
+
+        # AlphaQubitDecoder 子类：直接从属性提取
+        state = {}
+        if hasattr(encoder, 'syndrome_embedder'):
+            state.update({
+                f"syndrome_embedder.{k}": v
+                for k, v in encoder.syndrome_embedder.state_dict().items()
+            })
+        if hasattr(encoder, 'rnn_core'):
+            state.update({
+                f"rnn_core.{k}": v
+                for k, v in encoder.rnn_core.state_dict().items()
+            })
+
+        if state:
+            self._load_pretrained_encoder(state)
+            print(f"[FineTuneDecoder] 直接从 {type(encoder).__name__} 提取权重  "
+                  f"keys={len(state)}")
+        else:
+            print(f"[FineTuneDecoder] ⚠ {type(encoder).__name__} 未找到可迁移的 encoder 权重，"
+                  f"使用随机初始化")
 
     def _load_pretrained_encoder(self, state_dict: Dict[str, Tensor]):
         """加载预训练 Encoder 权重
