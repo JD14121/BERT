@@ -60,7 +60,7 @@ import time
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, IterableDataset
 from torch.optim import AdamW
 from torch.amp import autocast, GradScaler
 
@@ -122,6 +122,12 @@ class TrainingConfig:
     use_amp: bool = True               # 使用混合精度训练（大幅加速）
     use_compile: bool = False          # 使用torch.compile（PyTorch 2.0+）
 
+    # ==================== 新增：流式数据集支持 ====================
+    shuffle_train: bool = True
+    #IterableDataset（StreamingPAEMSDataset）必须设为 False；
+    # map-style Dataset（SurfaceCodeDataset）保持 True。
+    # finetune.py 传入 shuffle_train=False 时自动关闭。
+
 
 class Trainer:
     """AlphaQubit训练器
@@ -176,7 +182,8 @@ class Trainer:
         self.model = self.model.to(self.device)
 
         # 创建数据加载器
-        self.train_loader = self._create_dataloader(train_dataset, shuffle=True)
+        # 尊重 config.shuffle_train
+        self.train_loader = self._create_dataloader(train_dataset, shuffle=self.config.shuffle_train)
         self.val_loader = self._create_dataloader(val_dataset, shuffle=False)
 
         # 创建优化器
@@ -233,14 +240,21 @@ class Trainer:
         }
 
     def _create_dataloader(self, dataset, shuffle: bool) -> DataLoader:
-        """创建数据加载器"""
+        """创建数据加载器（兼容 map-style 和 IterableDataset）"""
+        #IterableDataset 不支持 shuffle 和 RandomSampler
+        is_iterable = isinstance(dataset, IterableDataset)
+        effective_shuffle = shuffle and not is_iterable
+
         batch_size = self.config.batch_size if shuffle else self.config.eval_batch_size
+
         return DataLoader(
             dataset,
             batch_size=batch_size,
-            shuffle=shuffle,
+            shuffle=effective_shuffle,
             num_workers=self.config.num_workers,
-            pin_memory=True if self.device.type == 'cuda' else False,
+            #IterableDataset + pin_memory 在某些环境下不稳定，显式关闭
+            pin_memory=(self.device.type == 'cuda') and not is_iterable,
+            drop_last=False,
         )
 
     def _default_logger(self, metrics: Dict):
