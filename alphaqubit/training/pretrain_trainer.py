@@ -20,7 +20,7 @@ import time
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, IterableDataset
 from torch.optim import AdamW
 from torch.amp import autocast, GradScaler
 
@@ -171,14 +171,19 @@ class PretrainTrainer:
         }
 
     def _create_dataloader(self, dataset, shuffle: bool) -> DataLoader:
-        """创建数据加载器"""
+        """创建数据加载器（兼容 map-style 和 IterableDataset）"""
+        is_iterable = isinstance(dataset, IterableDataset)
+        effective_shuffle = shuffle and not is_iterable
+
         batch_size = self.config.batch_size if shuffle else self.config.eval_batch_size
+
         return DataLoader(
             dataset,
             batch_size=batch_size,
-            shuffle=shuffle,
+            shuffle=effective_shuffle,
             num_workers=self.config.num_workers,
-            pin_memory=True if self.device.type == 'cuda' else False,
+            pin_memory=(self.device.type == 'cuda') and not is_iterable,
+            drop_last=False,
         )
 
     def _default_logger(self, metrics: Dict):
